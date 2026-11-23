@@ -36,6 +36,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -51,6 +52,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -74,7 +76,8 @@ typedef struct {
     size_t extent_count;
     uint64_t estimated_size;
     uint64_t data_bytes;
-    char extension[16];
+    char extension[64];
+    char mimetype[128];
 } Candidate;
 
 typedef struct {
@@ -115,7 +118,13 @@ typedef struct {
     bool dry_run;
     bool force_rw;
     bool quiet_scan;
-    bool trim_text_zeroes;
+
+    const char *recover_patterns;
+    const char *ignore_patterns;
+    const char *zero_patterns;
+    const char *magicfiles;
+    bool list_types;
+    bool passed_start;
 } Context;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -327,6 +336,143 @@ static const char *guess_extension(const uint8_t *p, size_t n) {
     return "bin";
 }
 
+
+static bool pattern_list_match(const char *patterns, const char *mimetype, const char *extension) {
+    if (!patterns || !*patterns) return false;
+    char *tmp = strdup(patterns);
+    if (!tmp) return false;
+    bool matched = false;
+    char *save = NULL;
+    for (char *pat = strtok_r(tmp, ",", &save); pat; pat = strtok_r(NULL, ",", &save)) {
+        const char *target = strchr(pat, '/') ? mimetype : extension;
+        if (!target) target = "";
+        if (fnmatch(pat, target, 0) == 0) { matched = true; break; }
+    }
+    free(tmp);
+    return matched;
+}
+
+static void extension_from_mimetype(const char *mime, char out[64]) {
+    struct map { const char *mime; const char *ext; };
+    static const struct map known[] = {
+        {"application/octet-stream","bin"}, {"text/plain","txt"},
+        {"image/jpeg","jpg"}, {"image/png","png"}, {"image/gif","gif"},
+        {"image/webp","webp"}, {"image/tiff","tif"}, {"image/bmp","bmp"},
+        {"image/svg+xml","svg"}, {"application/pdf","pdf"},
+        {"application/zip","zip"}, {"application/x-7z-compressed","7z"},
+        {"application/x-rar","rar"}, {"application/vnd.rar","rar"},
+        {"application/gzip","gz"}, {"application/x-gzip","gz"},
+        {"application/x-tar","tar"}, {"application/x-bzip2","bz2"},
+        {"application/x-xz","xz"}, {"audio/mpeg","mp3"},
+        {"audio/flac","flac"}, {"audio/ogg","ogg"}, {"audio/wav","wav"},
+        {"audio/x-wav","wav"}, {"video/mp4","mp4"},
+        {"video/quicktime","mov"}, {"video/x-msvideo","avi"},
+        {"video/x-matroska","mkv"}, {"video/webm","webm"},
+        {"video/mpeg","mpeg"},
+        {"application/vnd.openxmlformats-officedocument.wordprocessingml.document","docx"},
+        {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet","xlsx"},
+        {"application/vnd.openxmlformats-officedocument.presentationml.presentation","pptx"},
+        {"application/msword","doc"}, {"application/vnd.ms-excel","xls"},
+        {"application/vnd.ms-powerpoint","ppt"},
+        {"application/x-sqlite3","sqlite"}, {"application/vnd.sqlite3","sqlite"},
+        {NULL,NULL}
+    };
+    for (size_t i = 0; known[i].mime; ++i) {
+        if (!strcmp(mime, known[i].mime)) { snprintf(out, 64, "%s", known[i].ext); return; }
+    }
+    const char *slash = strchr(mime, '/');
+    if (!slash || !slash[1]) { snprintf(out, 64, "bin"); return; }
+    const char *sub = slash + 1;
+    if (!strncmp(sub, "x-", 2)) sub += 2;
+    size_t j = 0;
+    for (size_t i = 0; sub[i] && sub[i] != '+' && j + 1 < 64; ++i) {
+        unsigned char c = (unsigned char)sub[i];
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.') out[j++] = (char)c;
+    }
+    out[j] = 0;
+    if (!j) snprintf(out, 64, "bin");
+}
+
+static int run_file_mime(const uint8_t *data, size_t len, const char *magicfiles, char mime[128]) {
+    int inpipe[2], outpipe[2];
+    if (pipe(inpipe) < 0) return -1;
+    if (pipe(outpipe) < 0) { close(inpipe[0]); close(inpipe[1]); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) { close(inpipe[0]); close(inpipe[1]); close(outpipe[0]); close(outpipe[1]); return -1; }
+    if (pid == 0) {
+        dup2(inpipe[0], STDIN_FILENO);
+        dup2(outpipe[1], STDOUT_FILENO);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) dup2(dn, STDERR_FILENO);
+        close(inpipe[0]); close(inpipe[1]); close(outpipe[0]); close(outpipe[1]);
+        if (magicfiles && *magicfiles)
+            execlp("file", "file", "--brief", "--mime-type", "--magic", magicfiles, "-", (char*)NULL);
+        else
+            execlp("file", "file", "--brief", "--mime-type", "-", (char*)NULL);
+        _exit(127);
+    }
+    close(inpipe[0]); close(outpipe[1]);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(inpipe[1], data + off, len - off);
+        if (w < 0) { if (errno == EINTR) continue; break; }
+        off += (size_t)w;
+    }
+    close(inpipe[1]);
+    char buf[256]; size_t got = 0;
+    while (got + 1 < sizeof(buf)) {
+        ssize_t r = read(outpipe[0], buf + got, sizeof(buf) - 1 - got);
+        if (r == 0) break;
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        got += (size_t)r;
+    }
+    close(outpipe[0]);
+    int st = 0; waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || !got) return -1;
+    while (got && (buf[got-1] == '\n' || buf[got-1] == '\r' || buf[got-1] == ' ' || buf[got-1] == '\t')) --got;
+    buf[got] = 0;
+    snprintf(mime, 128, "%.127s", buf);
+    return 0;
+}
+
+static void builtin_identify(const uint8_t *p, size_t n, char mime[128], char ext[64]) {
+    const char *e = guess_extension(p, n);
+    snprintf(ext, 64, "%s", e);
+    if (!strcmp(e,"txt")) snprintf(mime,128,"text/plain");
+    else if (!strcmp(e,"jpg")) snprintf(mime,128,"image/jpeg");
+    else if (!strcmp(e,"png")) snprintf(mime,128,"image/png");
+    else if (!strcmp(e,"gif")) snprintf(mime,128,"image/gif");
+    else if (!strcmp(e,"pdf")) snprintf(mime,128,"application/pdf");
+    else if (!strcmp(e,"zip")) snprintf(mime,128,"application/zip");
+    else if (!strcmp(e,"gz")) snprintf(mime,128,"application/gzip");
+    else if (!strcmp(e,"ogg")) snprintf(mime,128,"audio/ogg");
+    else if (!strcmp(e,"flac")) snprintf(mime,128,"audio/flac");
+    else if (!strcmp(e,"wav")) snprintf(mime,128,"audio/wav");
+    else if (!strcmp(e,"avi")) snprintf(mime,128,"video/x-msvideo");
+    else if (!strcmp(e,"mkv")) snprintf(mime,128,"video/x-matroska");
+    else if (!strcmp(e,"mov")) snprintf(mime,128,"video/quicktime");
+    else if (!strcmp(e,"mp4")) snprintf(mime,128,"video/mp4");
+    else if (!strcmp(e,"sqlite")) snprintf(mime,128,"application/x-sqlite3");
+    else snprintf(mime,128,"application/octet-stream");
+}
+
+static void identify_buffer(const Context *ctx, const uint8_t *p, size_t n, char mime[128], char ext[64]) {
+    if (run_file_mime(p, n, ctx->magicfiles, mime) == 0) extension_from_mimetype(mime, ext);
+    else builtin_identify(p, n, mime, ext);
+}
+
+static int list_filetypes(const char *magicfiles) {
+    printf("extension    mimetype                                         description\n");
+    printf("bin          application/octet-stream                         Binary data\n");
+    printf("txt          text/plain                                       Plain Text\n");
+    printf("\nOther extensions/MIME types are supplied by the system file(1) magic database.\n");
+    printf("Patterns containing '/' match MIME types; other patterns match extensions.\n");
+    printf("Examples: video/*, image/*, application/pdf, mp4, mkv, jpg, docx\n");
+    if (magicfiles && *magicfiles) printf("Custom magic path: %s\n", magicfiles);
+    return 0;
+}
+
 static bool decode_extent(const Context *ctx, const uint8_t rec[16], Extent *out) {
     uint64_t hi = be64(rec);
     uint64_t lo = be64(rec + 8);
@@ -412,7 +558,10 @@ static void scan_inode_block(Context *ctx, uint32_t ag, uint32_t block) {
             extent_off = 100;
         }
 
-        if (ctx->have_start_inode && inode_no < ctx->start_inode) continue;
+        if (ctx->have_start_inode && !ctx->passed_start) {
+            if (inode_no == ctx->start_inode) ctx->passed_start = true;
+            else continue;
+        }
         if (is_excluded(ctx, inode_no)) continue;
         if (ino[2] != 0 || ino[3] != 0) continue;
 
@@ -457,13 +606,26 @@ static void scan_inode_block(Context *ctx, uint32_t ag, uint32_t block) {
         memcpy(c.extents, temp, ne * sizeof(*c.extents));
         c.extent_count = ne;
 
-        uint8_t first[4096];
-        size_t sniff = ctx->blocksize < sizeof(first) ? ctx->blocksize : sizeof(first);
+        size_t sniff = ctx->blocksize;
+        if (sniff < 65536) sniff = 65536;
+        if (sniff > 1024 * 1024) sniff = 1024 * 1024;
+        uint64_t first_extent_bytes = (uint64_t)c.extents[0].block_count * ctx->blocksize;
+        if ((uint64_t)sniff > first_extent_bytes) sniff = (size_t)first_extent_bytes;
+        uint8_t *first = malloc(sniff ? sniff : 1);
         uint64_t first_off = c.extents[0].physical_block * (uint64_t)ctx->blocksize;
-        if (pread_full(ctx->fd, first, sniff, first_off) == 0)
-            snprintf(c.extension, sizeof(c.extension), "%s", guess_extension(first, sniff));
-        else
+        if (first && sniff && pread_full(ctx->fd, first, sniff, first_off) == 0)
+            identify_buffer(ctx, first, sniff, c.mimetype, c.extension);
+        else {
+            snprintf(c.mimetype, sizeof(c.mimetype), "application/octet-stream");
             snprintf(c.extension, sizeof(c.extension), "bin");
+        }
+        free(first);
+
+        if (pattern_list_match(ctx->ignore_patterns, c.mimetype, c.extension) ||
+            !pattern_list_match(ctx->recover_patterns, c.mimetype, c.extension)) {
+            free(c.extents);
+            continue;
+        }
 
         if (!add_candidate(ctx, &c)) {
             free(c.extents);
@@ -692,7 +854,7 @@ static int recover_candidate(Context *ctx, const Candidate *c,
     double sec = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec)/1e9;
     render_progress("  file", file_done, c->data_bytes, sec, true);
 
-    if (!g_stop && ctx->trim_text_zeroes && !strcmp(c->extension, "txt")) {
+    if (!g_stop && pattern_list_match(ctx->zero_patterns, c->mimetype, c->extension)) {
         if (trim_trailing_zeroes(ofd, c->estimated_size, ctx->blocksize) < 0)
             fprintf(stderr, "  warning: failed to trim trailing zeroes: %s\n", strerror(errno));
     }
@@ -710,27 +872,36 @@ static int recover_candidate(Context *ctx, const Candidate *c,
 static void usage(FILE *f, const char *prog) {
     fprintf(f,
 "Usage: %s [options] DEVICE_OR_IMAGE\n"
+"       %s -l [-m MAGICFILES]\n"
 "\n"
-"Native XFS deleted-file recovery with a pre-copy size-estimation pass.\n"
+"Native XFS deleted-file recovery with pre-copy size estimation.\n"
 "\n"
-"Options:\n"
-"  -o, --output DIR       Output directory (default: xfs_undeleted)\n"
-"  -s, --start-inode N    Ignore candidate inodes below N\n"
-"  -S, --max-size SIZE    Ignore estimated files larger than SIZE\n"
-"                         suffixes: k/M/G/T, KiB/MiB/GiB/TiB\n"
-"  -x, --exclude LIST     Comma-separated inode numbers to skip\n"
-"  -t, --deleted RANGE    ctime/deletion range; examples:\n"
-"                         -2hours, 2026-11-23.., ..2026-11-23-16-00\n"
-"  -T, --modified RANGE   mtime range, same syntax\n"
-"  -n, --dry-run          Scan/estimate only; do not recover data\n"
-"      --force-rw         Allow scanning a source block device mounted rw\n"
-"      --no-trim-text     Do not trim zero padding from detected text files\n"
-"  -q, --quiet-scan       Suppress allocation-group scan progress\n"
-"  -h, --help             Show help\n"
+"Upstream-compatible options where practical:\n"
+"  -t RANGE              Deleted/ctime range\n"
+"  -T RANGE              Modified/mtime range\n"
+"  -r TYPES              Recover matching MIME/extensions (default: *)\n"
+"  -i TYPES              Ignore matching MIME/extensions (default: bin)\n"
+"  -x INODES             Comma-separated inode numbers to ignore\n"
+"  -S SIZE               Ignore estimated files larger than SIZE\n"
+"  -z TYPES              Trim trailing zeroes for types (default: text/*)\n"
+"  -o DIR                Output directory (default: xfs_undeleted)\n"
+"  -s INODE              Resume when this exact inode is encountered\n"
+"  -m MAGICFILES         Magic path passed to file(1)\n"
+"  -l                    List filter/filetype information and exit\n"
 "\n"
-"Exact deleted-file EOF cannot generally be recovered from XFS metadata.\n"
-"The reported size is the end of the highest valid surviving written extent.\n",
-            prog);
+"Native additions:\n"
+"  -n, --dry-run         Scan and estimate only\n"
+"      --force-rw        Permit reading a block device mounted read-write\n"
+"      --no-remount-readonly  Upstream-compatible alias for --force-rw\n"
+"  -q, --quiet-scan      Suppress allocation-group scan progress\n"
+"  -h, --help            Show help\n"
+"\n"
+"TYPE lists are comma-separated shell patterns. Patterns containing '/' match\n"
+"MIME types; all other patterns match extensions. Quote wildcards in the shell.\n"
+"Examples: -r 'video/*'   -r 'image/*,pdf,docx'   -i 'bin'\n"
+"\n"
+"The XFS source is always opened O_RDONLY and is never written or remounted.\n",
+            prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -739,9 +910,12 @@ int main(int argc, char **argv) {
     ctx.out_dir = "xfs_undeleted";
     ctx.ctime_min = ctx.mtime_min = 0;
     ctx.ctime_max = ctx.mtime_max = INT64_MAX;
-    ctx.trim_text_zeroes = true;
+    ctx.recover_patterns = "*";
+    ctx.ignore_patterns = "bin";
+    ctx.zero_patterns = "text/*";
+    ctx.passed_start = true;
 
-    enum { OPT_FORCE_RW = 1000, OPT_NO_TRIM_TEXT };
+    enum { OPT_FORCE_RW = 1000 };
     static const struct option opts[] = {
         {"output", required_argument, 0, 'o'},
         {"start-inode", required_argument, 0, 's'},
@@ -749,23 +923,28 @@ int main(int argc, char **argv) {
         {"exclude", required_argument, 0, 'x'},
         {"deleted", required_argument, 0, 't'},
         {"modified", required_argument, 0, 'T'},
+        {"recover", required_argument, 0, 'r'},
+        {"ignore", required_argument, 0, 'i'},
+        {"trim-zeroes", required_argument, 0, 'z'},
+        {"magic", required_argument, 0, 'm'},
+        {"list", no_argument, 0, 'l'},
         {"dry-run", no_argument, 0, 'n'},
         {"force-rw", no_argument, 0, OPT_FORCE_RW},
-        {"no-trim-text", no_argument, 0, OPT_NO_TRIM_TEXT},
+        {"no-remount-readonly", no_argument, 0, OPT_FORCE_RW},
         {"quiet-scan", no_argument, 0, 'q'},
         {"help", no_argument, 0, 'h'},
         {0,0,0,0}
     };
 
     int ch;
-    while ((ch = getopt_long(argc, argv, "o:s:S:x:t:T:nqh", opts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "o:s:S:x:t:T:r:i:z:m:lnqh", opts, NULL)) != -1) {
         switch (ch) {
         case 'o': ctx.out_dir = optarg; break;
         case 's': {
             char *e = NULL; errno = 0;
             ctx.start_inode = strtoull(optarg, &e, 10);
             if (errno || e == optarg || *e) { fprintf(stderr, "Invalid start inode\n"); return 2; }
-            ctx.have_start_inode = true; break;
+            ctx.have_start_inode = true; ctx.passed_start = false; break;
         }
         case 'S':
             if (!parse_size(optarg, &ctx.max_size)) { fprintf(stderr, "Invalid max size\n"); return 2; }
@@ -783,14 +962,20 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Invalid modification/mtime range: %s\n", optarg); return 2;
             }
             break;
+        case 'r': ctx.recover_patterns = (*optarg ? optarg : "*"); break;
+        case 'i': ctx.ignore_patterns = optarg; break;
+        case 'z': ctx.zero_patterns = optarg; break;
+        case 'm': ctx.magicfiles = optarg; break;
+        case 'l': ctx.list_types = true; break;
         case 'n': ctx.dry_run = true; break;
         case 'q': ctx.quiet_scan = true; break;
         case OPT_FORCE_RW: ctx.force_rw = true; break;
-        case OPT_NO_TRIM_TEXT: ctx.trim_text_zeroes = false; break;
         case 'h': usage(stdout, argv[0]); return 0;
         default: usage(stderr, argv[0]); return 2;
         }
     }
+
+    if (ctx.list_types) return list_filetypes(ctx.magicfiles);
 
     if (optind + 1 != argc) {
         usage(stderr, argv[0]);
@@ -875,6 +1060,7 @@ int main(int argc, char **argv) {
                     i + 1, ctx.candidate_count, c->inode,
                     human_size(c->estimated_size, a), human_size(c->data_bytes, b),
                     c->extent_count, c->extension);
+            fprintf(stderr, "           mime=%s\n", c->mimetype);
         }
     }
 
