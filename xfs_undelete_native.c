@@ -61,6 +61,8 @@
 #define XFS_SB_MAGIC "XFSB"
 #define MAX_EXTENTS_PER_INODE 64
 #define COPY_BUFSIZE (4u * 1024u * 1024u)
+#define PROGRESS_SYNC_BYTES (64ull * 1024ull * 1024ull)
+#define PROGRESS_SYNC_SECONDS 1.0
 
 typedef struct {
     uint64_t logical_block;
@@ -909,10 +911,23 @@ static int recover_candidate(Context *ctx, const Candidate *c,
     uint8_t *buf = malloc(COPY_BUFSIZE);
     if (!buf) { perror("malloc"); close(ofd); return -1; }
 
-    struct timespec t0, now;
+    struct timespec t0, now, last_sync_ts;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    uint64_t file_done = 0;
-    double last_draw = -1;
+    last_sync_ts = t0;
+
+    /*
+     * pwrite() normally completes when Linux has accepted data into the page
+     * cache, not when the destination device has actually finished writing it.
+     *
+     * Progress therefore tracks periodically flushed bytes instead of merely
+     * submitted bytes.  fdatasync() every 64 MiB or ~1 second prevents a huge
+     * hidden writeback backlog and makes the displayed transfer rate much
+     * closer to real destination throughput.  The final 100% is not displayed
+     * until the final fsync() has completed.
+     */
+    uint64_t file_submitted = 0;
+    uint64_t file_committed = 0;
+    uint64_t pending_commit = 0;
 
     for (size_t ei = 0; ei < c->extent_count && !g_stop; ++ei) {
         const Extent *e = &c->extents[ei];
@@ -931,27 +946,76 @@ static int recover_candidate(Context *ctx, const Candidate *c,
                 fprintf(stderr, "\n  ERROR writing output: %s\n", strerror(errno));
                 free(buf); close(ofd); return -1;
             }
-            src += chunk; dst += chunk; remain -= chunk;
-            file_done += chunk; *overall_done += chunk;
+
+            src += chunk;
+            dst += chunk;
+            remain -= chunk;
+            file_submitted += chunk;
+            pending_commit += chunk;
 
             clock_gettime(CLOCK_MONOTONIC, &now);
-            double sec = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec)/1e9;
-            if (sec - last_draw >= 0.2 || file_done == c->data_bytes) {
-                render_progress("  file", file_done, c->data_bytes, sec, false);
-                last_draw = sec;
+            double since_sync =
+                (now.tv_sec - last_sync_ts.tv_sec) +
+                (now.tv_nsec - last_sync_ts.tv_nsec) / 1e9;
+
+            if (pending_commit >= PROGRESS_SYNC_BYTES ||
+                since_sync >= PROGRESS_SYNC_SECONDS) {
+                if (fdatasync(ofd) < 0) {
+                    fprintf(stderr, "\n  ERROR flushing output data: %s\n",
+                            strerror(errno));
+                    free(buf);
+                    close(ofd);
+                    return -1;
+                }
+
+                file_committed += pending_commit;
+                *overall_done += pending_commit;
+                pending_commit = 0;
+
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                last_sync_ts = now;
+                double sec =
+                    (now.tv_sec - t0.tv_sec) +
+                    (now.tv_nsec - t0.tv_nsec) / 1e9;
+                render_progress("  file", file_committed, c->data_bytes, sec, false);
             }
         }
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double sec = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec)/1e9;
-    render_progress("  file", file_done, c->data_bytes, sec, true);
-
+    /*
+     * Any text zero trimming changes the destination file itself, so perform it
+     * before the final durability barrier and before reporting 100%.
+     */
     if (!g_stop && pattern_list_match(ctx->zero_patterns, c->mimetype, c->extension)) {
         if (trim_trailing_zeroes(ofd, c->estimated_size, ctx->blocksize) < 0)
-            fprintf(stderr, "  warning: failed to trim trailing zeroes: %s\n", strerror(errno));
+            fprintf(stderr, "\n  warning: failed to trim trailing zeroes: %s\n",
+                    strerror(errno));
     }
-    if (fsync(ofd) < 0) fprintf(stderr, "  warning: fsync failed: %s\n", strerror(errno));
+
+    if (!g_stop) {
+        /*
+         * fsync() is intentionally before the 100% display.  At this point the
+         * destination file's data and required metadata have been flushed as
+         * far as the OS/filesystem can guarantee.
+         */
+        if (fsync(ofd) < 0) {
+            fprintf(stderr, "\n  ERROR finalizing output file: %s\n", strerror(errno));
+            free(buf);
+            close(ofd);
+            return -1;
+        }
+
+        file_committed += pending_commit;
+        *overall_done += pending_commit;
+        pending_commit = 0;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double sec =
+            (now.tv_sec - t0.tv_sec) +
+            (now.tv_nsec - t0.tv_nsec) / 1e9;
+        render_progress("  file", file_committed, c->data_bytes, sec, true);
+    }
+
     free(buf);
     close(ofd);
 
