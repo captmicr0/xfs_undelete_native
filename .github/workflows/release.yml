@@ -1,0 +1,79 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build static x86-64 release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build static musl binary
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/src \
+            -w /src \
+            alpine:3.22 \
+            sh -c '
+              set -eux
+              apk add --no-cache build-base musl-dev
+              gcc -O2 -static -std=gnu11 \
+                -D_FILE_OFFSET_BITS=64 \
+                -Wall -Wextra -Wpedantic \
+                -o xfs_undelete_native \
+                xfs_undelete_native.c
+            '
+
+      - name: Verify binary
+        run: |
+          set -eux
+          file xfs_undelete_native
+          test -x xfs_undelete_native
+          if ldd ./xfs_undelete_native 2>&1 | grep -qv "not a dynamic executable"; then
+            echo "Binary does not appear to be fully static."
+            exit 1
+          fi
+
+      - name: Rename release binary
+        run: |
+          set -eux
+          mv xfs_undelete_native xfs_undelete_native-linux-x86_64
+          sha256sum xfs_undelete_native-linux-x86_64 \
+            > xfs_undelete_native-linux-x86_64.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfs_undelete_native-linux-x86_64
+          path: |
+            xfs_undelete_native-linux-x86_64
+            xfs_undelete_native-linux-x86_64.sha256
+          if-no-files-found: error
+
+      - name: Create GitHub release and upload files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; uploading/replacing assets."
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
+
+          gh release upload "${GITHUB_REF_NAME}" \
+            xfs_undelete_native-linux-x86_64 \
+            xfs_undelete_native-linux-x86_64.sha256 \
+            --clobber
