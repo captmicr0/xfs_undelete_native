@@ -361,45 +361,183 @@ static bool pattern_list_match(const char *patterns, const char *mimetype, const
 }
 
 static void extension_from_mimetype(const char *mime, char out[64]) {
-    struct map { const char *mime; const char *ext; };
+    struct map { const char *mime, *ext; };
     static const struct map known[] = {
-        {"application/octet-stream","bin"}, {"text/plain","txt"},
-        {"image/jpeg","jpg"}, {"image/png","png"}, {"image/gif","gif"},
-        {"image/webp","webp"}, {"image/tiff","tif"}, {"image/bmp","bmp"},
-        {"image/svg+xml","svg"}, {"application/pdf","pdf"},
-        {"application/zip","zip"}, {"application/x-7z-compressed","7z"},
-        {"application/x-rar","rar"}, {"application/vnd.rar","rar"},
-        {"application/gzip","gz"}, {"application/x-gzip","gz"},
-        {"application/x-tar","tar"}, {"application/x-bzip2","bz2"},
-        {"application/x-xz","xz"}, {"audio/mpeg","mp3"},
-        {"audio/flac","flac"}, {"audio/ogg","ogg"}, {"audio/wav","wav"},
-        {"audio/x-wav","wav"}, {"video/mp4","mp4"},
-        {"video/quicktime","mov"}, {"video/x-msvideo","avi"},
-        {"video/x-matroska","mkv"}, {"video/webm","webm"},
+        /* Generic / text */
+        {"application/octet-stream","bin"},
+        {"text/plain","txt"},
+        {"text/csv","csv"},
+        {"text/html","html"},
+        {"text/css","css"},
+        {"text/xml","xml"},
+        {"application/xml","xml"},
+        {"application/json","json"},
+        {"application/rtf","rtf"},
+
+        /* Images */
+        {"image/jpeg","jpg"},
+        {"image/jpg","jpg"},
+        {"image/png","png"},
+        {"image/gif","gif"},
+        {"image/webp","webp"},
+        {"image/tiff","tif"},
+        {"image/bmp","bmp"},
+        {"image/x-ms-bmp","bmp"},
+        {"image/svg+xml","svg"},
+        {"image/heic","heic"},
+        {"image/heif","heif"},
+        {"image/avif","avif"},
+
+        /* Video */
+        {"video/mp4","mp4"},
+        {"application/mp4","mp4"},
+        {"video/quicktime","mov"},
+        {"video/x-msvideo","avi"},
+        {"video/avi","avi"},
+        {"video/x-matroska","mkv"},
+        {"application/x-matroska","mkv"},
+        {"video/matroska","mkv"},
+        {"application/matroska","mkv"},
+        {"video/webm","webm"},
+        {"audio/webm","webm"},
         {"video/mpeg","mpeg"},
+        {"video/mp2t","ts"},
+        {"video/x-ms-wmv","wmv"},
+        {"video/x-flv","flv"},
+        {"application/vnd.rn-realmedia","rm"},
+        {"application/vnd.rn-realmedia-vbr","rmvb"},
+        {"video/3gpp","3gp"},
+        {"video/3gpp2","3g2"},
+
+        /* Audio */
+        {"audio/mpeg","mp3"},
+        {"audio/mp3","mp3"},
+        {"audio/flac","flac"},
+        {"audio/x-flac","flac"},
+        {"audio/ogg","ogg"},
+        {"application/ogg","ogg"},
+        {"audio/wav","wav"},
+        {"audio/x-wav","wav"},
+        {"audio/wave","wav"},
+        {"audio/vnd.wave","wav"},
+        {"audio/aac","aac"},
+        {"audio/x-aac","aac"},
+        {"audio/mp4","m4a"},
+        {"audio/x-m4a","m4a"},
+        {"audio/opus","opus"},
+        {"audio/x-ms-wma","wma"},
+        {"audio/midi","mid"},
+        {"audio/x-midi","mid"},
+
+        /* Archives / compressed */
+        {"application/zip","zip"},
+        {"application/x-zip-compressed","zip"},
+        {"application/x-7z-compressed","7z"},
+        {"application/x-rar","rar"},
+        {"application/vnd.rar","rar"},
+        {"application/x-rar-compressed","rar"},
+        {"application/gzip","gz"},
+        {"application/x-gzip","gz"},
+        {"application/x-tar","tar"},
+        {"application/x-bzip2","bz2"},
+        {"application/x-xz","xz"},
+        {"application/zstd","zst"},
+        {"application/x-zstd","zst"},
+
+        /* Documents */
+        {"application/pdf","pdf"},
+        {"application/msword","doc"},
+        {"application/vnd.ms-excel","xls"},
+        {"application/vnd.ms-powerpoint","ppt"},
         {"application/vnd.openxmlformats-officedocument.wordprocessingml.document","docx"},
         {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet","xlsx"},
         {"application/vnd.openxmlformats-officedocument.presentationml.presentation","pptx"},
-        {"application/msword","doc"}, {"application/vnd.ms-excel","xls"},
-        {"application/vnd.ms-powerpoint","ppt"},
-        {"application/x-sqlite3","sqlite"}, {"application/vnd.sqlite3","sqlite"},
+        {"application/vnd.oasis.opendocument.text","odt"},
+        {"application/vnd.oasis.opendocument.spreadsheet","ods"},
+        {"application/vnd.oasis.opendocument.presentation","odp"},
+
+        /* Executables / disk / database */
+        {"application/x-executable","bin"},
+        {"application/x-pie-executable","bin"},
+        {"application/x-sharedlib","so"},
+        {"application/x-dosexec","exe"},
+        {"application/vnd.microsoft.portable-executable","exe"},
+        {"application/x-msdownload","exe"},
+        {"application/x-sqlite3","sqlite"},
+        {"application/vnd.sqlite3","sqlite"},
+        {"application/x-iso9660-image","iso"},
+
         {NULL,NULL}
     };
+
+    if (!mime || !*mime) {
+        snprintf(out, 64, "bin");
+        return;
+    }
+
     for (size_t i = 0; known[i].mime; ++i) {
-        if (!strcmp(mime, known[i].mime)) { snprintf(out, 64, "%s", known[i].ext); return; }
+        if (!strcasecmp(mime, known[i].mime)) {
+            snprintf(out, 64, "%s", known[i].ext);
+            return;
+        }
     }
+
+    /*
+     * A few subtype aliases are worth normalizing even if file(1) returns
+     * a vendor/nonstandard top-level type.
+     */
     const char *slash = strchr(mime, '/');
-    if (!slash || !slash[1]) { snprintf(out, 64, "bin"); return; }
-    const char *sub = slash + 1;
-    if (!strncmp(sub, "x-", 2)) sub += 2;
-    size_t j = 0;
-    for (size_t i = 0; sub[i] && sub[i] != '+' && j + 1 < 64; ++i) {
-        unsigned char c = (unsigned char)sub[i];
-        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
-        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.') out[j++] = (char)c;
+    if (slash && slash[1]) {
+        const char *sub = slash + 1;
+
+        if (!strcasecmp(sub, "x-matroska") || !strcasecmp(sub, "matroska")) {
+            snprintf(out, 64, "mkv");
+            return;
+        }
+        if (!strcasecmp(sub, "x-msvideo") || !strcasecmp(sub, "avi")) {
+            snprintf(out, 64, "avi");
+            return;
+        }
+        if (!strcasecmp(sub, "quicktime")) {
+            snprintf(out, 64, "mov");
+            return;
+        }
+        if (!strcasecmp(sub, "x-ms-wmv")) {
+            snprintf(out, 64, "wmv");
+            return;
+        }
+        if (!strcasecmp(sub, "x-flv")) {
+            snprintf(out, 64, "flv");
+            return;
+        }
+        if (!strcasecmp(sub, "x-ms-wma")) {
+            snprintf(out, 64, "wma");
+            return;
+        }
+
+        /*
+         * Unknown MIME: derive a conservative extension from the subtype.
+         * Strip common x- prefix and structured syntax suffix (+xml/+json).
+         */
+        if (!strncasecmp(sub, "x-", 2)) sub += 2;
+
+        char tmp[64];
+        size_t j = 0;
+        for (size_t i = 0; sub[i] && sub[i] != '+' && j + 1 < sizeof(tmp); ++i) {
+            unsigned char c = (unsigned char)sub[i];
+            if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+            if ((c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') ||
+                c == '-' || c == '.') {
+                tmp[j++] = (char)c;
+            }
+        }
+        tmp[j] = 0;
+        snprintf(out, 64, "%s", j ? tmp : "bin");
+        return;
     }
-    out[j] = 0;
-    if (!j) snprintf(out, 64, "bin");
+
+    snprintf(out, 64, "bin");
 }
 
 static int run_file_mime(const uint8_t *data, size_t len, const char *magicfiles, char mime[128]) {
