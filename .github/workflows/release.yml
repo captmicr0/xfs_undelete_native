@@ -5,6 +5,13 @@ on:
     tags:
       - "v*"
 
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/use (leave blank for manual-<run number>)"
+        required: false
+        type: string
+
 permissions:
   contents: write
 
