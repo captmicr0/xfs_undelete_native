@@ -2,15 +2,19 @@
 
 A native C deleted-file recovery utility for XFS, inspired by [`xfs_undelete`](https://github.com/ianka/xfs_undelete).
 
-The goal is to provide the useful recovery behavior of `xfs_undelete` in a standalone native executable while adding:
+It reads XFS metadata directly, performs a complete discovery/estimation pass before copying data, and adds detailed recovery progress tracking.
 
-- a complete metadata scan **before copying**
-- estimated recoverable file sizes before recovery begins
+Key goals:
+
+- standalone native executable
+- source filesystem opened read-only
+- pre-copy file-size estimation
 - per-file copy progress
 - transfer speed and ETA
 - overall recovery progress
-- stricter validation of stale/deleted extent metadata
-- native MIME/extension filtering compatible with the practical `xfs_undelete` filter syntax
+- MIME/extension filtering
+- stronger validation of stale deleted-inode extent metadata
+- explicit diagnostic/force-recovery controls for suspicious candidates
 
 > **The XFS source is always opened read-only.**
 >
@@ -18,33 +22,41 @@ The goal is to provide the useful recovery behavior of `xfs_undelete` in a stand
 
 ---
 
-## Safety
+# Safety
 
 Deleted-file recovery should be performed with as little activity on the source filesystem as possible.
 
-The source device is opened with:
+The XFS source is opened with:
 
 ```c
 open(source, O_RDONLY | O_CLOEXEC)
 ```
 
-All XFS source reads use `pread()`.
+Source data is read with:
 
-Recovered files are created on the destination filesystem and written using `pwrite()`.
+```c
+pread()
+```
 
-The program never uses `write()`, `pwrite()`, `ftruncate()`, `fsync()`, or another write operation against the XFS source descriptor.
+Recovered files are created on the destination filesystem and written with:
 
-### Recommended recovery setup
+```c
+pwrite()
+```
+
+The source descriptor is never passed to `write()`, `pwrite()`, `ftruncate()`, `fsync()`, or another write operation.
+
+## Recommended setup
 
 Prefer one of these:
 
 - source filesystem unmounted
 - source filesystem mounted read-only
-- recovery performed against a block-level image
+- recovery performed from a block-level image
 
 Always recover to a **different filesystem/device**.
 
-Do not recover files onto the filesystem being recovered. New writes can overwrite deleted file data that would otherwise still be recoverable.
+Do not recover files onto the filesystem being recovered. New writes can overwrite deleted data that may still be recoverable.
 
 ---
 
@@ -53,32 +65,35 @@ Do not recover files onto the filesystem being recovered. New writes can overwri
 - Native C implementation
 - Reads XFS metadata directly
 - Source device opened `O_RDONLY`
-- No Tcl or Python runtime
+- No Tcl runtime
+- No Python runtime
 - No `dd` subprocess for recovery
 - Works with block devices and raw XFS filesystem images
-- Pre-copy metadata discovery pass
-- Estimated logical file size before recovery
+- Metadata discovery pass before recovery
+- Estimated logical file size before copying
 - Total estimated recovery size
-- Actual physical extent bytes that will be copied
-- Per-file progress percentage
-- Per-file throughput
-- Per-file ETA
+- Actual physical extent bytes to copy
+- Per-file copy percentage
+- Transfer speed
+- ETA
 - Overall copy progress
 - Sparse-file reconstruction
 - MIME-type filtering
 - Extension filtering
-- MIME wildcard filtering such as `video/*`
+- MIME wildcards such as `video/*`
 - Ignore filters
 - Deletion/ctime filtering
 - Modification/mtime filtering
 - Maximum-size filtering
 - Specific inode exclusions
 - Resume/start at an exact inode
-- Trailing-zero trimming for selected types
+- Trailing-zero trimming
 - Custom `file(1)` magic database support
 - Dry-run mode
-- Extent overlap validation
-- Stale sparse-extent sanity checks
+- Extent-overlap validation
+- Oversize sparse-file sanity validation
+- Diagnostic mode for viewing rejected candidates
+- Exact-inode forced recovery mode
 - Refuses a source block device mounted read/write unless explicitly overridden
 - Refuses to recover onto the source block device
 
@@ -86,9 +101,9 @@ Do not recover files onto the filesystem being recovered. New writes can overwri
 
 # Building
 
-## Recommended: static x86-64 build with Docker
+## Recommended: static x86-64 build using Docker
 
-For running on Slackware/Unraid while building on another Linux system, a statically linked musl binary is recommended.
+For building on Debian/Ubuntu or another Linux system and running on Slackware/Unraid, a statically linked musl build is recommended.
 
 From the repository root:
 
@@ -105,13 +120,13 @@ docker run --rm \
     xfs_undelete_native.c'
 ```
 
-The resulting executable will be:
+The executable will appear as:
 
 ```text
 xfs_undelete_native
 ```
 
-Verify it:
+Verify that it is static:
 
 ```bash
 file xfs_undelete_native
@@ -165,7 +180,7 @@ musl-gcc -O2 -static -std=gnu11 \
 
 # Runtime file-type detection
 
-For full MIME detection, `xfs_undelete_native` uses the system:
+For full MIME detection, the program uses the system:
 
 ```text
 file
@@ -173,15 +188,13 @@ file
 
 utility and its magic database.
 
-On most Unraid/Slackware installations this is already available.
-
-Check with:
+Check availability with:
 
 ```bash
 file --version
 ```
 
-If `file` is unavailable or cannot identify a candidate, the program falls back to built-in signature detection for common formats such as:
+If `file` is unavailable or cannot identify the data, built-in signature detection is used for common formats including:
 
 - MP4
 - MOV
@@ -200,7 +213,7 @@ If `file` is unavailable or cannot identify a candidate, the program falls back 
 - plain text
 - generic binary data
 
-The recovery executable itself can still be statically linked; `file(1)` is only used as an external MIME identification helper.
+The recovery executable itself can still be fully statically linked.
 
 ---
 
@@ -218,7 +231,7 @@ Example:
   /dev/sdh1
 ```
 
-A raw filesystem image can also be used:
+Raw filesystem images can also be used:
 
 ```bash
 ./xfs_undelete_native \
@@ -228,19 +241,9 @@ A raw filesystem image can also be used:
 
 ---
 
-# Example: recover videos deleted on a specific date
+# Typical video-recovery example
 
-Equivalent to:
-
-```bash
-./xfs_undelete \
-  -t 2026-11-23 \
-  -r 'video/*' \
-  -o /mnt/disks/SanDisk_Ultra_USB_3.0/ \
-  /dev/sdh1
-```
-
-with the native version:
+Recover videos deleted on November 23, 2026:
 
 ```bash
 ./xfs_undelete_native \
@@ -250,7 +253,7 @@ with the native version:
   /dev/sdh1
 ```
 
-For a dry run first:
+Dry run first:
 
 ```bash
 ./xfs_undelete_native \
@@ -265,7 +268,19 @@ For a dry run first:
 
 # Dry-run mode
 
-A dry run performs the metadata scan, filtering, extent validation, MIME detection, and size estimation without creating recovered files.
+A dry run performs:
+
+- XFS metadata scanning
+- deleted-inode discovery
+- extent decoding
+- MIME detection
+- filtering
+- sanity validation
+- size estimation
+
+It does **not** copy recovered file data.
+
+Example:
 
 ```bash
 ./xfs_undelete_native \
@@ -275,29 +290,27 @@ A dry run performs the metadata scan, filtering, extent validation, MIME detecti
   /dev/sdh1
 ```
 
-Example:
+Example output:
 
 ```text
 Phase 1/2: scanning metadata and estimating sizes
 (NO file data is being copied)...
 
 Pre-copy estimate complete.
-  recoverable candidates:       15
-  estimated logical output:     9.84 GiB
-  actual extent bytes to copy:  9.81 GiB
-  inode records inspected:      148203
-  rejected overlapping layouts: 3
-  rejected oversize sparse:      2
+  recoverable candidates:        8
+  estimated logical output:      25.70 GiB
+  actual extent bytes to copy:   25.02 GiB
+  inode records inspected:       303360
+  rejected overlapping layouts:  6
+  rejected oversize sparse:       1
 ```
 
-Candidates are then listed before any recovery copy begins:
+Candidates are listed before any copy operation begins:
 
 ```text
-[1/3] inode=10888791452  est=159.84 MiB  data=159.84 MiB  extents=1  type=.mp4
+[1/8] inode=10888791452  est=159.84 MiB  data=159.84 MiB  extents=1  type=.mp4
          mime=video/mp4
 ```
-
-This makes it possible to inspect likely recovery results before writing anything to the destination.
 
 ---
 
@@ -305,78 +318,59 @@ This makes it possible to inspect likely recovery results before writing anythin
 
 XFS normally destroys the exact original EOF/file length when an inode is deleted.
 
-Because of this, the exact original byte size usually cannot be recovered.
+Because of that, the exact original byte size usually cannot be recovered from deleted inode metadata.
 
-`xfs_undelete_native` estimates the logical size using the end of the highest surviving valid logical extent.
+The program estimates logical size from the end of the highest surviving valid logical extent.
 
-For example:
-
-```text
-logical extent:
-    start block = 1000
-    block count = 100
-```
-
-ends at logical block:
-
-```text
-1100
-```
-
-The estimated file size is therefore based on:
-
-```text
-1100 * XFS block size
-```
-
-The final recovered filesystem block may contain padding beyond the original EOF.
-
-The utility reports two separate measurements:
+The utility reports:
 
 ```text
 estimated logical size
 ```
 
-and:
+and separately:
 
 ```text
 extent data to copy
 ```
 
-The first represents the reconstructed logical file span.
+The first is the reconstructed logical span.
 
-The second represents the amount of physical extent data that will actually be read from the XFS source.
+The second is the amount of physical XFS data that will actually be read.
+
+Sparse holes therefore increase logical size without increasing physical bytes copied.
 
 ---
 
 # Extent sanity checks
 
-Deleted inode forks can contain stale bytes.
+Deleted inode forks can contain stale data.
 
-Some stale 128-bit values can accidentally resemble valid XFS extent records. Without validation this can produce absurd results such as:
+Some stale 128-bit values can accidentally decode into values that look like XFS extent records.
 
-```text
-estimated size: 36.94 PiB
-data to copy:   20.27 GiB
-```
-
-or physically impossible layouts where:
+Without validation, this can produce impossible or absurd candidates such as:
 
 ```text
-extent data > logical file span
+estimated logical size: 36.94 PiB
+extent data to copy:    20.27 GiB
 ```
 
-The native implementation performs additional validation before accepting a candidate.
+or:
+
+```text
+estimated logical size: 587 MiB
+extent data to copy:    739 MiB
+```
+
+The program performs additional sanity validation before accepting candidates.
 
 ## Duplicate logical offsets
 
-Multiple decoded records beginning at the same logical block are collapsed to one logical extent position.
-
-This prevents duplicate stale extent records from being counted repeatedly.
+Exact duplicate stale extent records are collapsed during normal recovery validation.
 
 ## Overlapping logical extents
 
-If surviving decoded extents overlap after normalization, the candidate is rejected.
+Conflicting or overlapping logical extents are rejected.
 
 The dry-run summary reports:
 
@@ -384,19 +378,123 @@ The dry-run summary reports:
 rejected overlapping layouts
 ```
 
-## Oversize sparse reconstruction
+## Oversize sparse candidates
 
-By default, a candidate whose reconstructed logical size is larger than the entire XFS data device is rejected.
+By default, a reconstructed logical file larger than the entire XFS data device is rejected.
 
-This catches stale metadata that otherwise creates petabyte-scale sparse files from a filesystem many orders of magnitude smaller.
+This catches stale metadata that would otherwise generate absurd sparse files.
 
-The summary reports:
+The dry-run summary reports:
 
 ```text
 rejected oversize sparse
 ```
 
-For the unusual case of a legitimately enormous sparse file, this check can be disabled with:
+---
+
+# Inspecting rejected candidates
+
+Sometimes a rejected candidate may still contain recoverable data.
+
+For diagnosis, use:
+
+```bash
+--ignore-checks
+```
+
+This option is intentionally restricted to **dry-run mode only**.
+
+Example:
+
+```bash
+./xfs_undelete_native \
+  --dry-run \
+  --ignore-checks \
+  -t 2026-11-23 \
+  -r 'video/*' \
+  /dev/sde1
+```
+
+This lists candidates that would normally be rejected by the overlap/oversize sanity checks.
+
+No file data is copied.
+
+If `--ignore-checks` is used without `--dry-run`, the program refuses to run:
+
+```text
+REFUSING: --ignore-checks is diagnostic-only and may only be used with --dry-run.
+To intentionally recover one rejected inode, use --force-inode INODE instead.
+```
+
+This separation is intentional:
+
+1. use `--ignore-checks --dry-run` to discover the inode
+2. inspect the candidate
+3. explicitly force only that inode if desired
+
+---
+
+# Forced recovery of one inode
+
+To intentionally recover a candidate that failed optional sanity validation, use:
+
+```bash
+--force-inode INODE
+```
+
+Example:
+
+```bash
+./xfs_undelete_native \
+  --force-inode 10887782598 \
+  -o /mnt/disks/SanDisk_Ultra_USB_3.0/ \
+  /dev/sde1
+```
+
+`--force-inode`:
+
+- considers only the exact inode specified
+- bypasses overlapping-logical-extent rejection for that inode
+- bypasses oversize-sparse rejection for that inode
+- bypasses normal time/type/max-size filtering for that inode
+- does **not** bypass physical source-device bounds checks
+- still opens the XFS source strictly `O_RDONLY`
+
+This is intentionally safer than a global force mode because only one explicitly selected inode is allowed through.
+
+## Recommended workflow for a rejected inode
+
+First expose rejected candidates:
+
+```bash
+./xfs_undelete_native \
+  --dry-run \
+  --ignore-checks \
+  -t 2026-11-23 \
+  -r 'video/*' \
+  /dev/sde1
+```
+
+Suppose the candidate you want is:
+
+```text
+inode=10887782598
+```
+
+Then recover only it:
+
+```bash
+./xfs_undelete_native \
+  --force-inode 10887782598 \
+  -o /mnt/disks/SanDisk_Ultra_USB_3.0/ \
+  /dev/sde1
+```
+
+---
+
+# `--allow-oversize-sparse`
+
+For the unusual case of a legitimately huge sparse file, the normal oversize-sparse sanity check can be disabled:
 
 ```bash
 --allow-oversize-sparse
@@ -406,26 +504,34 @@ Example:
 
 ```bash
 ./xfs_undelete_native \
-  --allow-oversize-sparse \
   --dry-run \
+  --allow-oversize-sparse \
   /dev/sdh1
 ```
 
-Use this only when you have a specific reason to expect extremely large sparse files.
+This does not disable overlap validation.
+
+For a specific suspicious inode, prefer:
+
+```bash
+--force-inode INODE
+```
+
+instead of broadly disabling sanity checks.
 
 ---
 
 # Filtering
 
-Filter syntax follows the practical behavior of `xfs_undelete`.
+Filtering follows the practical behavior of `xfs_undelete`.
 
 A filter is a comma-separated list of shell-style patterns.
 
-Patterns containing `/` are matched against the MIME type.
+Patterns containing `/` match MIME types.
 
-Patterns without `/` are matched against the detected extension.
+Patterns without `/` match detected extensions.
 
-Always quote wildcard expressions so the shell does not expand them.
+Quote wildcard expressions so the shell does not expand them.
 
 ---
 
@@ -433,14 +539,6 @@ Always quote wildcard expressions so the shell does not expand them.
 
 ```bash
 -r 'video/*'
-```
-
-Example:
-
-```bash
-./xfs_undelete_native \
-  -r 'video/*' \
-  /dev/sdh1
 ```
 
 ---
@@ -477,15 +575,15 @@ Example:
 
 ---
 
-## Ignore file types
+## Ignore types
 
-Default:
+Default ignored extension:
 
 ```text
 bin
 ```
 
-Override it with:
+Override with:
 
 ```bash
 -i 'bin,tmp'
@@ -526,8 +624,6 @@ Examples:
 ```bash
 -t '2026-11-23-12-00..2026-11-23-17-00'
 ```
-
-Supported relative units include seconds, minutes, hours, days, and weeks.
 
 ---
 
@@ -596,6 +692,12 @@ Ignore specific inode numbers.
 Example:
 
 ```bash
+-x 12890064564
+```
+
+Multiple inodes:
+
+```bash
 -x 123456,123457,123900
 ```
 
@@ -615,7 +717,7 @@ Examples:
 -S 10GiB
 ```
 
-Supported units include decimal and binary size suffixes such as:
+Supported suffixes include:
 
 ```text
 k
@@ -646,13 +748,11 @@ Example:
 -z 'text/*,svg'
 ```
 
-Because the exact deleted EOF is normally unavailable, this can improve recovered plain-text files that otherwise end with zero padding.
-
 ---
 
 ## `-o DIR`
 
-Set the recovery destination.
+Set recovery destination.
 
 Default:
 
@@ -670,9 +770,9 @@ Example:
 
 ## `-s INODE`
 
-Skip recovery traversal until the exact inode is encountered.
+Skip traversal until the exact inode is encountered.
 
-Useful when resuming a previous run.
+Useful when resuming a previous scan/recovery.
 
 Example:
 
@@ -680,11 +780,21 @@ Example:
 -s 12890064563
 ```
 
+This is different from:
+
+```bash
+--force-inode
+```
+
+`-s` resumes normal traversal and normal sanity checks.
+
+`--force-inode` selects one exact inode and bypasses optional sanity rejection for that inode.
+
 ---
 
 ## `-m MAGICFILES`
 
-Pass a custom magic database path to `file(1)`.
+Pass a custom magic database to `file(1)`.
 
 Example:
 
@@ -706,7 +816,7 @@ Display filetype/filter information and exit.
 
 ## `-n`, `--dry-run`
 
-Scan, filter, validate, and estimate candidates without recovering file data.
+Scan, validate, filter, and estimate without copying recovered data.
 
 ```bash
 ./xfs_undelete_native --dry-run /dev/sdh1
@@ -714,51 +824,71 @@ Scan, filter, validate, and estimate candidates without recovering file data.
 
 ---
 
-## `--force-rw`
+## `--ignore-checks`
 
-Normally the utility refuses to scan a block device if Linux reports that device as mounted read/write.
+Diagnostic mode for displaying candidates rejected by the optional overlap/oversize checks.
 
-This option disables that safety check:
+**May only be used together with `--dry-run`.**
+
+Example:
 
 ```bash
-./xfs_undelete_native --force-rw /dev/sdh1
+./xfs_undelete_native \
+  --dry-run \
+  --ignore-checks \
+  /dev/sdh1
 ```
 
-The source is **still opened `O_RDONLY`**.
-
-This option only permits recovery while another mount may be writing to the same filesystem.
-
-That is dangerous for data recovery and is not recommended.
+This option can never perform recovery.
 
 ---
 
-## `--no-remount-readonly`
+## `--force-inode INODE`
 
-Compatibility alias for:
+Recover exactly one inode while bypassing the optional overlap/oversize sanity checks for that inode.
 
-```text
---force-rw
+Example:
+
+```bash
+./xfs_undelete_native \
+  --force-inode 10887782598 \
+  -o /mnt/disks/recovery/ \
+  /dev/sdh1
 ```
 
-The native program does not actually remount the source.
-
-This option exists for command-line compatibility only.
+Physical source bounds checks remain enforced.
 
 ---
 
 ## `--allow-oversize-sparse`
 
-Allow reconstructed logical sizes larger than the entire XFS data device.
+Permit logical sparse files larger than the entire XFS data device.
 
-Disabled by default.
+This only bypasses the oversize-sparse check.
 
-Use only when recovering a known legitimately enormous sparse file.
+---
+
+## `--force-rw`
+
+Normally the program refuses to scan a block device reported as mounted read/write.
+
+This option disables that protection:
+
+```bash
+./xfs_undelete_native \
+  --force-rw \
+  /dev/sdh1
+```
+
+The source is still opened `O_RDONLY`.
+
+This is not recommended for normal data recovery.
 
 ---
 
 ## `-q`, `--quiet-scan`
 
-Suppress allocation-group scanning progress.
+Suppress allocation-group scan progress.
 
 ---
 
@@ -784,39 +914,35 @@ During recovery:
 file               43.67%  311.15 MiB / 712.53 MiB  126.8 MiB/s  ETA 3s
 ```
 
-Overall copied progress is shown between files.
+Overall copied progress is displayed between files.
 
 ---
 
 # Sparse files
 
-Recovered files are created at their estimated logical size and surviving extents are written to their original logical offsets.
+Recovered files are created at their estimated logical size and surviving extents are written to their logical offsets.
 
 Missing logical regions remain sparse holes.
 
 Conceptually:
 
 ```text
-XFS source
+source extent A ─────────────┐
+                             │
+source extent B ────────┐    │
+                        │    │
+                        v    v
 
-extent A ─────────────┐
-                      │
-extent B ────────┐    │
-                 │    │
-                 v    v
-
-destination file
+destination:
 
 [ extent A ][ hole ][ extent B ]
 ```
 
-This avoids physically writing zeros for missing logical regions.
+The program does not physically write zeros for sparse holes.
 
 ---
 
 # Source vs destination I/O
-
-The recovery path is intentionally separated:
 
 ```text
 XFS source block device / image
@@ -834,29 +960,25 @@ XFS source block device / image
 recovery destination filesystem
 ```
 
-`pwrite()` operates only on the recovered destination file.
+`pwrite()` is used only for recovery output files.
 
-It is never called with the XFS source descriptor.
+It is never used on the source descriptor.
 
 ---
 
-# Recommended workflow
+# Recommended recovery workflow
 
-## 1. Stop writes to the XFS filesystem
+## 1. Stop writes to the source
 
-Unmount it if possible:
+Unmount if possible:
 
 ```bash
 umount /dev/sdh1
 ```
 
-Do not mount it read/write again before recovery.
-
 ---
 
-## 2. Run a dry scan
-
-For example:
+## 2. Run a normal dry scan
 
 ```bash
 ./xfs_undelete_native \
@@ -869,16 +991,17 @@ For example:
 Review:
 
 - candidate count
-- MIME types
-- extensions
-- estimated sizes
-- physical copy sizes
-- extent counts
-- rejected bogus layouts
+- MIME type
+- extension
+- estimated size
+- physical data size
+- extent count
+- rejected overlap count
+- rejected oversize-sparse count
 
 ---
 
-## 3. Recover to another device
+## 3. Recover normal candidates
 
 ```bash
 ./xfs_undelete_native \
@@ -888,23 +1011,37 @@ Review:
   /dev/sdh1
 ```
 
-Make sure:
+---
 
-```text
-/mnt/disks/SanDisk_Ultra_USB_3.0/
-```
+## 4. Inspect suspicious rejected candidates if necessary
 
-is not located on:
-
-```text
-/dev/sdh1
+```bash
+./xfs_undelete_native \
+  --dry-run \
+  --ignore-checks \
+  -t 2026-11-23 \
+  -r 'video/*' \
+  /dev/sdh1
 ```
 
 ---
 
-# Working from a disk image
+## 5. Force only a specific rejected inode if desired
 
-For important data, consider creating a block-level image first.
+```bash
+./xfs_undelete_native \
+  --force-inode 10887782598 \
+  -o /mnt/disks/SanDisk_Ultra_USB_3.0/ \
+  /dev/sdh1
+```
+
+This limits the dangerous override to one explicitly selected inode.
+
+---
+
+# Working from a filesystem image
+
+For valuable data, consider making a block-level image first.
 
 Using GNU ddrescue:
 
@@ -915,7 +1052,7 @@ ddrescue -f -n \
   xfs-recovery.map
 ```
 
-Then recover from the image:
+Then scan the image:
 
 ```bash
 ./xfs_undelete_native \
@@ -924,7 +1061,7 @@ Then recover from the image:
   xfs-recovery.img
 ```
 
-Actual recovery:
+Recover from the image:
 
 ```bash
 ./xfs_undelete_native \
@@ -937,7 +1074,7 @@ Actual recovery:
 
 # GitHub Actions release build
 
-The repository can use the included release workflow to build a static x86-64 executable using Alpine/musl.
+The repository can use the release workflow to build a static x86-64 executable using Alpine/musl.
 
 A version tag such as:
 
@@ -951,10 +1088,13 @@ can trigger a release build.
 The workflow can also be started manually from:
 
 ```text
-GitHub → Actions → Build and Release → Run workflow
+GitHub
+→ Actions
+→ Build and Release
+→ Run workflow
 ```
 
-Release assets include:
+Typical release assets:
 
 ```text
 xfs_undelete_native-linux-x86_64
@@ -972,14 +1112,16 @@ Potential limitations include:
 - original filename may be unavailable
 - original directory path may be unavailable
 - exact original EOF may be unavailable
-- some extents may already have been reallocated
-- surviving inode fork data may be incomplete
-- fragmented files may recover only partially
+- some extents may have been reallocated
+- fragmented files may recover partially
+- stale inode-fork bytes can resemble valid extent records
 - file signatures can be misidentified
-- deleted metadata can contain stale extent-looking values
-- filesystem activity after deletion reduces recovery probability
+- recovered output may contain padding or stale tail bytes
+- continued filesystem activity reduces recovery probability
 
-The sanity checks intentionally prefer rejecting suspicious extent layouts over creating absurd sparse files from obviously stale metadata.
+The default sanity checks intentionally prefer rejecting suspicious mappings over automatically creating absurd or conflicting reconstructed files.
+
+`--ignore-checks` and `--force-inode` exist for cases where the operator intentionally wants to inspect or attempt recovery of one of those suspicious candidates.
 
 ---
 
@@ -993,7 +1135,7 @@ The source currently identifies itself as:
 GPL-3.0-or-later
 ```
 
-When publishing or distributing the repository, include the appropriate GPL license text as:
+When distributing the repository, include the appropriate GPL license text as:
 
 ```text
 LICENSE
@@ -1005,11 +1147,12 @@ LICENSE
 
 Filesystem recovery is inherently best-effort.
 
-There is no guarantee that a candidate inode still points entirely to the original deleted file or that recovered data will be complete and uncorrupted.
+There is no guarantee that a candidate inode still points entirely to the original deleted file or that recovered output will be complete or uncorrupted.
 
 For important data:
 
 1. stop writes immediately
 2. preserve the source
-3. work from an image when possible
+3. work from an image when practical
 4. recover to another filesystem
+5. treat forced recovery of rejected inode layouts as experimental

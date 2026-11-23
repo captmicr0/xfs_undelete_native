@@ -128,6 +128,9 @@ typedef struct {
     bool list_types;
     bool passed_start;
     bool allow_oversize_sparse;
+    bool ignore_checks;
+    bool have_force_inode;
+    uint64_t force_inode;
 } Context;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -561,17 +564,30 @@ static void scan_inode_block(Context *ctx, uint32_t ag, uint32_t block) {
             extent_off = 100;
         }
 
-        if (ctx->have_start_inode && !ctx->passed_start) {
-            if (inode_no == ctx->start_inode) ctx->passed_start = true;
-            else continue;
+        /*
+         * --force-inode is deliberately exact: once supplied, every other
+         * inode is ignored.  It also bypasses user filters and the optional
+         * overlap/oversize sanity checks for that inode, but never bypasses
+         * physical source bounds checks in decode_extent().
+         */
+        if (ctx->have_force_inode && inode_no != ctx->force_inode) continue;
+
+        if (!ctx->have_force_inode) {
+            if (ctx->have_start_inode && !ctx->passed_start) {
+                if (inode_no == ctx->start_inode) ctx->passed_start = true;
+                else continue;
+            }
+            if (is_excluded(ctx, inode_no)) continue;
         }
-        if (is_excluded(ctx, inode_no)) continue;
+
         if (ino[2] != 0 || ino[3] != 0) continue;
 
         int64_t mtime_sec = decode_xfs_time(ctx->bigtime, ino + 40);
         int64_t ctime_sec = decode_xfs_time(ctx->bigtime, ino + 48);
-        if (ctime_sec < ctx->ctime_min || ctime_sec > ctx->ctime_max) continue;
-        if (mtime_sec < ctx->mtime_min || mtime_sec > ctx->mtime_max) continue;
+        if (!ctx->have_force_inode) {
+            if (ctime_sec < ctx->ctime_min || ctime_sec > ctx->ctime_max) continue;
+            if (mtime_sec < ctx->mtime_min || mtime_sec > ctx->mtime_max) continue;
+        }
 
         Extent temp[MAX_EXTENTS_PER_INODE];
         size_t ne = 0;
@@ -587,40 +603,48 @@ static void scan_inode_block(Context *ctx, uint32_t ag, uint32_t block) {
         if (temp[0].logical_block != 0) continue;
 
         /*
-         * Deleted inode forks can contain stale 128-bit words that happen to
-         * decode as plausible bmbt records. Normalize exact duplicates and
-         * reject conflicting/overlapping logical mappings. A valid extent
-         * list cannot have two different physical mappings for the same
-         * logical range.
+         * Normal recovery rejects conflicting/overlapping mappings and
+         * absurd sparse logical sizes.  Two explicit diagnostic/override
+         * modes can bypass those optional checks:
+         *
+         *   --ignore-checks   dry-run only; exposes suspicious candidates.
+         *   --force-inode N   only inode N; permits actual recovery.
+         *
+         * Neither mode bypasses decode_extent()'s physical-device bounds
+         * validation, so source reads remain constrained to the XFS device.
          */
-        size_t nn = 0;
+        const bool bypass_sanity = ctx->ignore_checks || ctx->have_force_inode;
         bool bad_overlap = false;
-        for (size_t i = 0; i < ne; ++i) {
-            if (nn > 0) {
-                Extent *prev = &temp[nn - 1];
-                uint64_t prev_end = prev->logical_block + prev->block_count;
 
-                if (temp[i].logical_block == prev->logical_block) {
-                    if (temp[i].physical_block == prev->physical_block &&
-                        temp[i].block_count == prev->block_count) {
-                        continue; /* exact duplicate stale record */
+        if (!bypass_sanity) {
+            size_t nn = 0;
+            for (size_t i = 0; i < ne; ++i) {
+                if (nn > 0) {
+                    Extent *prev = &temp[nn - 1];
+                    uint64_t prev_end = prev->logical_block + prev->block_count;
+
+                    if (temp[i].logical_block == prev->logical_block) {
+                        if (temp[i].physical_block == prev->physical_block &&
+                            temp[i].block_count == prev->block_count) {
+                            continue; /* exact duplicate stale record */
+                        }
+                        bad_overlap = true;
+                        break;
                     }
-                    bad_overlap = true;
-                    break;
+                    if (temp[i].logical_block < prev_end) {
+                        bad_overlap = true;
+                        break;
+                    }
                 }
-                if (temp[i].logical_block < prev_end) {
-                    bad_overlap = true;
-                    break;
-                }
+                temp[nn++] = temp[i];
             }
-            temp[nn++] = temp[i];
+            if (bad_overlap) {
+                ctx->rejected_overlapping++;
+                continue;
+            }
+            ne = nn;
+            if (!ne || temp[0].logical_block != 0) continue;
         }
-        if (bad_overlap) {
-            ctx->rejected_overlapping++;
-            continue;
-        }
-        ne = nn;
-        if (!ne || temp[0].logical_block != 0) continue;
 
         uint64_t est_blocks = 0, data_blocks = 0;
         for (size_t i = 0; i < ne; ++i) {
@@ -636,25 +660,31 @@ static void scan_inode_block(Context *ctx, uint32_t ag, uint32_t block) {
             }
             data_blocks += temp[i].block_count;
         }
-        if (bad_overlap || data_blocks > est_blocks) {
+
+        if (bad_overlap) {
+            if (!bypass_sanity) ctx->rejected_overlapping++;
+            continue; /* integer overflow is never safe to bypass */
+        }
+
+        if (!bypass_sanity && data_blocks > est_blocks) {
             ctx->rejected_overlapping++;
             continue;
         }
 
         /*
          * A sparse file can technically have a logical size larger than its
-         * filesystem, but deleted-inode recovery commonly encounters stale
-         * records producing absurd PiB logical offsets. Reject those by
-         * default; --allow-oversize-sparse disables this guard.
+         * filesystem.  Normal recovery rejects such candidates unless
+         * --allow-oversize-sparse was requested.  Diagnostic --ignore-checks
+         * and exact --force-inode recovery also bypass this optional guard.
          */
-        if (!ctx->allow_oversize_sparse && est_blocks > ctx->dblocks) {
+        if (!bypass_sanity && !ctx->allow_oversize_sparse && est_blocks > ctx->dblocks) {
             ctx->rejected_oversize_sparse++;
             continue;
         }
 
         if (est_blocks > UINT64_MAX / ctx->blocksize) continue;
         uint64_t est = est_blocks * ctx->blocksize;
-        if (ctx->have_max_size && est > ctx->max_size) continue;
+        if (!ctx->have_force_inode && ctx->have_max_size && est > ctx->max_size) continue;
 
         Candidate c;
         memset(&c, 0, sizeof(c));
@@ -683,8 +713,9 @@ static void scan_inode_block(Context *ctx, uint32_t ag, uint32_t block) {
         }
         free(first);
 
-        if (pattern_list_match(ctx->ignore_patterns, c.mimetype, c.extension) ||
-            !pattern_list_match(ctx->recover_patterns, c.mimetype, c.extension)) {
+        if (!ctx->have_force_inode &&
+            (pattern_list_match(ctx->ignore_patterns, c.mimetype, c.extension) ||
+             !pattern_list_match(ctx->recover_patterns, c.mimetype, c.extension))) {
             free(c.extents);
             continue;
         }
@@ -956,6 +987,8 @@ static void usage(FILE *f, const char *prog) {
 "      --force-rw        Permit reading a block device mounted read-write\n"
 "      --no-remount-readonly  Upstream-compatible alias for --force-rw\n"
 "      --allow-oversize-sparse  Permit logical files larger than the XFS device\n"
+"      --ignore-checks   DRY-RUN ONLY: show candidates rejected by sanity checks\n"
+"      --force-inode N   Recover ONLY inode N and bypass optional sanity checks\n"
 "  -q, --quiet-scan      Suppress allocation-group scan progress\n"
 "  -h, --help            Show help\n"
 "\n"
@@ -978,7 +1011,12 @@ int main(int argc, char **argv) {
     ctx.zero_patterns = "text/*";
     ctx.passed_start = true;
 
-    enum { OPT_FORCE_RW = 1000, OPT_ALLOW_OVERSIZE_SPARSE };
+    enum {
+        OPT_FORCE_RW = 1000,
+        OPT_ALLOW_OVERSIZE_SPARSE,
+        OPT_IGNORE_CHECKS,
+        OPT_FORCE_INODE
+    };
     static const struct option opts[] = {
         {"output", required_argument, 0, 'o'},
         {"start-inode", required_argument, 0, 's'},
@@ -995,6 +1033,8 @@ int main(int argc, char **argv) {
         {"force-rw", no_argument, 0, OPT_FORCE_RW},
         {"no-remount-readonly", no_argument, 0, OPT_FORCE_RW},
         {"allow-oversize-sparse", no_argument, 0, OPT_ALLOW_OVERSIZE_SPARSE},
+        {"ignore-checks", no_argument, 0, OPT_IGNORE_CHECKS},
+        {"force-inode", required_argument, 0, OPT_FORCE_INODE},
         {"quiet-scan", no_argument, 0, 'q'},
         {"help", no_argument, 0, 'h'},
         {0,0,0,0}
@@ -1035,12 +1075,33 @@ int main(int argc, char **argv) {
         case 'q': ctx.quiet_scan = true; break;
         case OPT_FORCE_RW: ctx.force_rw = true; break;
         case OPT_ALLOW_OVERSIZE_SPARSE: ctx.allow_oversize_sparse = true; break;
+        case OPT_IGNORE_CHECKS: ctx.ignore_checks = true; break;
+        case OPT_FORCE_INODE: {
+            char *e = NULL;
+            errno = 0;
+            ctx.force_inode = strtoull(optarg, &e, 10);
+            if (errno || e == optarg || *e || ctx.force_inode == 0) {
+                fprintf(stderr, "Invalid force inode: %s\n", optarg);
+                return 2;
+            }
+            ctx.have_force_inode = true;
+            break;
+        }
         case 'h': usage(stdout, argv[0]); return 0;
         default: usage(stderr, argv[0]); return 2;
         }
     }
 
     if (ctx.list_types) return list_filetypes(ctx.magicfiles);
+
+    if (ctx.ignore_checks && !ctx.dry_run) {
+        fprintf(stderr,
+                "REFUSING: --ignore-checks is diagnostic-only and may only be used "
+                "with --dry-run.\n"
+                "To intentionally recover one rejected inode, use "
+                "--force-inode INODE instead.\n");
+        return 2;
+    }
 
     if (optind + 1 != argc) {
         usage(stderr, argv[0]);
@@ -1082,6 +1143,18 @@ int main(int argc, char **argv) {
             "Phase 1/2: scanning metadata and estimating sizes (NO file data is being copied)...\n",
             ctx.blocksize, ctx.inodesize, ctx.agcount, ctx.agblocks, ctx.dblocks,
             ctx.bigtime ? "yes" : "no");
+
+    if (ctx.ignore_checks) {
+        fprintf(stderr,
+                "WARNING: --ignore-checks enabled for DRY RUN; suspicious overlap/"
+                "oversize candidates will be listed but never copied.\n");
+    }
+    if (ctx.have_force_inode) {
+        fprintf(stderr,
+                "WARNING: --force-inode=%" PRIu64 " selected; only this inode will "
+                "be considered and optional overlap/oversize checks are bypassed.\n",
+                ctx.force_inode);
+    }
 
     for (uint32_t ag = 0; ag < ctx.agcount && !g_stop; ++ag) {
         uint8_t *agi = malloc(ctx.sectsize);
@@ -1131,6 +1204,13 @@ int main(int argc, char **argv) {
                     c->extent_count, c->extension);
             fprintf(stderr, "           mime=%s\n", c->mimetype);
         }
+    }
+
+    if (ctx.have_force_inode && ctx.candidate_count == 0) {
+        fprintf(stderr,
+                "\nRequested inode %" PRIu64 " was not found as a recoverable "
+                "deleted inode with at least one physically valid extent.\n",
+                ctx.force_inode);
     }
 
     if (ctx.dry_run || ctx.candidate_count == 0) {
