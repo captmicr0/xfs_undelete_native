@@ -114,6 +114,8 @@ typedef struct {
     uint64_t visited_inodes;
     uint64_t total_estimated_size;
     uint64_t total_data_bytes;
+    uint64_t rejected_overlapping;
+    uint64_t rejected_oversize_sparse;
 
     bool dry_run;
     bool force_rw;
@@ -125,6 +127,7 @@ typedef struct {
     const char *magicfiles;
     bool list_types;
     bool passed_start;
+    bool allow_oversize_sparse;
 } Context;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -583,13 +586,72 @@ static void scan_inode_block(Context *ctx, uint32_t ag, uint32_t block) {
         qsort(temp, ne, sizeof(temp[0]), extent_cmp);
         if (temp[0].logical_block != 0) continue;
 
+        /*
+         * Deleted inode forks can contain stale 128-bit words that happen to
+         * decode as plausible bmbt records. Normalize exact duplicates and
+         * reject conflicting/overlapping logical mappings. A valid extent
+         * list cannot have two different physical mappings for the same
+         * logical range.
+         */
+        size_t nn = 0;
+        bool bad_overlap = false;
+        for (size_t i = 0; i < ne; ++i) {
+            if (nn > 0) {
+                Extent *prev = &temp[nn - 1];
+                uint64_t prev_end = prev->logical_block + prev->block_count;
+
+                if (temp[i].logical_block == prev->logical_block) {
+                    if (temp[i].physical_block == prev->physical_block &&
+                        temp[i].block_count == prev->block_count) {
+                        continue; /* exact duplicate stale record */
+                    }
+                    bad_overlap = true;
+                    break;
+                }
+                if (temp[i].logical_block < prev_end) {
+                    bad_overlap = true;
+                    break;
+                }
+            }
+            temp[nn++] = temp[i];
+        }
+        if (bad_overlap) {
+            ctx->rejected_overlapping++;
+            continue;
+        }
+        ne = nn;
+        if (!ne || temp[0].logical_block != 0) continue;
+
         uint64_t est_blocks = 0, data_blocks = 0;
         for (size_t i = 0; i < ne; ++i) {
+            if (temp[i].logical_block > UINT64_MAX - temp[i].block_count) {
+                bad_overlap = true;
+                break;
+            }
             uint64_t end = temp[i].logical_block + temp[i].block_count;
             if (end > est_blocks) est_blocks = end;
-            if (UINT64_MAX - data_blocks < temp[i].block_count) { data_blocks = UINT64_MAX; break; }
+            if (UINT64_MAX - data_blocks < temp[i].block_count) {
+                bad_overlap = true;
+                break;
+            }
             data_blocks += temp[i].block_count;
         }
+        if (bad_overlap || data_blocks > est_blocks) {
+            ctx->rejected_overlapping++;
+            continue;
+        }
+
+        /*
+         * A sparse file can technically have a logical size larger than its
+         * filesystem, but deleted-inode recovery commonly encounters stale
+         * records producing absurd PiB logical offsets. Reject those by
+         * default; --allow-oversize-sparse disables this guard.
+         */
+        if (!ctx->allow_oversize_sparse && est_blocks > ctx->dblocks) {
+            ctx->rejected_oversize_sparse++;
+            continue;
+        }
+
         if (est_blocks > UINT64_MAX / ctx->blocksize) continue;
         uint64_t est = est_blocks * ctx->blocksize;
         if (ctx->have_max_size && est > ctx->max_size) continue;
@@ -893,6 +955,7 @@ static void usage(FILE *f, const char *prog) {
 "  -n, --dry-run         Scan and estimate only\n"
 "      --force-rw        Permit reading a block device mounted read-write\n"
 "      --no-remount-readonly  Upstream-compatible alias for --force-rw\n"
+"      --allow-oversize-sparse  Permit logical files larger than the XFS device\n"
 "  -q, --quiet-scan      Suppress allocation-group scan progress\n"
 "  -h, --help            Show help\n"
 "\n"
@@ -915,7 +978,7 @@ int main(int argc, char **argv) {
     ctx.zero_patterns = "text/*";
     ctx.passed_start = true;
 
-    enum { OPT_FORCE_RW = 1000 };
+    enum { OPT_FORCE_RW = 1000, OPT_ALLOW_OVERSIZE_SPARSE };
     static const struct option opts[] = {
         {"output", required_argument, 0, 'o'},
         {"start-inode", required_argument, 0, 's'},
@@ -931,6 +994,7 @@ int main(int argc, char **argv) {
         {"dry-run", no_argument, 0, 'n'},
         {"force-rw", no_argument, 0, OPT_FORCE_RW},
         {"no-remount-readonly", no_argument, 0, OPT_FORCE_RW},
+        {"allow-oversize-sparse", no_argument, 0, OPT_ALLOW_OVERSIZE_SPARSE},
         {"quiet-scan", no_argument, 0, 'q'},
         {"help", no_argument, 0, 'h'},
         {0,0,0,0}
@@ -970,6 +1034,7 @@ int main(int argc, char **argv) {
         case 'n': ctx.dry_run = true; break;
         case 'q': ctx.quiet_scan = true; break;
         case OPT_FORCE_RW: ctx.force_rw = true; break;
+        case OPT_ALLOW_OVERSIZE_SPARSE: ctx.allow_oversize_sparse = true; break;
         case 'h': usage(stdout, argv[0]); return 0;
         default: usage(stderr, argv[0]); return 2;
         }
@@ -1045,11 +1110,15 @@ int main(int argc, char **argv) {
             "  recoverable candidates:       %zu\n"
             "  estimated logical output:     %s\n"
             "  actual extent bytes to copy:  %s\n"
-            "  inode records inspected:      %" PRIu64 "\n",
+            "  inode records inspected:      %" PRIu64 "\n"
+            "  rejected overlapping layouts: %" PRIu64 "\n"
+            "  rejected oversize sparse:      %" PRIu64 "\n",
             ctx.candidate_count,
             human_size(ctx.total_estimated_size, hlog),
             human_size(ctx.total_data_bytes, hdata),
-            ctx.visited_inodes);
+            ctx.visited_inodes,
+            ctx.rejected_overlapping,
+            ctx.rejected_oversize_sparse);
 
     if (ctx.candidate_count) {
         fprintf(stderr, "\nCandidate sizes (known BEFORE copying):\n");
